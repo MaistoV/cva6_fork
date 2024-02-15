@@ -57,7 +57,7 @@ module load_store_unit import ariane_pkg::*; #(
     output logic                     acc_mmu_valid_o,      // translation is valid
     output logic [riscv::PLEN-1:0]   acc_mmu_paddr_o,      // translated address
     output exception_t               acc_mmu_exception_o,  // address translation threw an exception
-    
+
     // icache translation requests
     input  icache_areq_o_t           icache_areq_i,
     output icache_areq_i_t           icache_areq_o,
@@ -95,13 +95,6 @@ module load_store_unit import ariane_pkg::*; #(
     output [ariane_pkg::TRANS_ID_BITS-1:0] lsu_addr_trans_id_o
 );
 
-    // Mock signal driving
-    assign acc_mmu_dtlb_hit_o = '0;
-    assign acc_mmu_dtlb_ppn_o = '0;
-    assign acc_mmu_valid_o = '0;
-    assign acc_mmu_paddr_o = '0;
-    assign acc_mmu_exception_o = '0;
-
     // data is misaligned
     logic data_misaligned;
     // --------------------------------------
@@ -109,7 +102,7 @@ module load_store_unit import ariane_pkg::*; #(
     // --------------------------------------
     // those are the signals which are always correct
     // e.g.: they keep the value in the stall case
-    lsu_ctrl_t lsu_ctrl;
+    lsu_ctrl_t lsu_ctrl, lsu_ctrl_byp;
 
     logic      pop_st;
     logic      pop_ld;
@@ -131,16 +124,16 @@ module load_store_unit import ariane_pkg::*; #(
     logic                     st_valid_i;
     logic                     ld_valid_i;
     logic                     ld_translation_req;
-    logic                     st_translation_req;
+    logic                     cva6_st_translation_req, acc_st_translation_req, st_translation_req;
     logic [riscv::VLEN-1:0]   ld_vaddr;
     logic [riscv::VLEN-1:0]   st_vaddr;
-    logic                     translation_req;
-    logic                     translation_valid;
-    logic [riscv::VLEN-1:0]   mmu_vaddr;
-    logic [riscv::PLEN-1:0]   mmu_paddr, mmu_vaddr_plen, fetch_vaddr_plen;
-    exception_t               mmu_exception;
-    logic                     dtlb_hit;
-    logic [riscv::PPNW-1:0]   dtlb_ppn;
+    logic                     cva6_translation_req, acc_translation_req, translation_req;
+    logic                     cva6_translation_valid, acc_translataion_valid, translation_valid;
+    logic [riscv::VLEN-1:0]   cva6_mmu_vaddr, acc_mmu_vaddr, mmu_vaddr;
+    logic [riscv::PLEN-1:0]   cva6_mmu_paddr, acc_mmu_paddr, mmu_paddr, mmu_vaddr_plen, fetch_vaddr_plen;
+    exception_t               cva6_mmu_exception, acc_mmu_exception, mmu_exception;
+    logic                     cva6_dtlb_hit, acc_dtlb_hit, dtlb_hit;
+    logic [riscv::PPNW-1:0]   cva6_dtlb_ppn, acc_dtlb_ppn, dtlb_ppn;
 
     logic                     ld_valid;
     logic [TRANS_ID_BITS-1:0] ld_trans_id;
@@ -152,7 +145,7 @@ module load_store_unit import ariane_pkg::*; #(
     logic [11:0]              page_offset;
     logic                     page_offset_matches;
 
-    exception_t               misaligned_exception;
+    exception_t               cva6_misaligned_exception, acc_misaligned_exception, misaligned_exception;
     exception_t               ld_ex;
     exception_t               st_ex;
 
@@ -220,10 +213,10 @@ module load_store_unit import ariane_pkg::*; #(
     end else begin : gen_no_mmu
 
         if (riscv::VLEN > riscv::PLEN) begin
-          assign mmu_vaddr_plen = mmu_vaddr[riscv::PLEN-1:0];
+          assign mmu_vaddr_plen = cva6_mmu_vaddr[riscv::PLEN-1:0];
           assign fetch_vaddr_plen = icache_areq_i.fetch_vaddr[riscv::PLEN-1:0];
         end else begin
-          assign mmu_vaddr_plen = {{{riscv::PLEN-riscv::VLEN}{1'b0}}, mmu_vaddr};
+          assign mmu_vaddr_plen = {{{riscv::PLEN-riscv::VLEN}{1'b0}}, cva6_mmu_vaddr};
           assign fetch_vaddr_plen = {{{riscv::PLEN-riscv::VLEN}{1'b0}}, icache_areq_i.fetch_vaddr};
         end
 
@@ -243,22 +236,94 @@ module load_store_unit import ariane_pkg::*; #(
 
         assign itlb_miss_o = 1'b0;
         assign dtlb_miss_o = 1'b0;
-        assign dtlb_ppn    = mmu_vaddr_plen[riscv::PLEN-1:12];
-        assign dtlb_hit    = 1'b1;
+        assign cva6_dtlb_ppn    = mmu_vaddr_plen[riscv::PLEN-1:12];
+        assign cva6_dtlb_hit    = 1'b1;
 
-        assign mmu_exception = '0;
+        assign cva6_mmu_exception = '0;
 
         always_ff @(posedge clk_i or negedge rst_ni) begin
             if (~rst_ni) begin
-                mmu_paddr         <= '0;
-                translation_valid <= '0;
+                cva6_mmu_paddr         <= '0;
+                cva6_translation_valid <= '0;
             end else begin
-                mmu_paddr         <=  mmu_vaddr_plen;
-                translation_valid <= translation_req;
+                cva6_mmu_paddr         <=  mmu_vaddr_plen;
+                cva6_translation_valid <= cva6_translation_req;
             end
         end
     end
 
+    // The MMU can be connected to CVA6 or the ACCELERATOR
+    enum logic {CVA6, ACC} mmu_state_d, mmu_state_q;
+    always_ff @(posedge clk_i or negedge rst_ni) begin
+      if (~rst_ni) begin
+        mmu_state_q <= CVA6;
+      end else begin
+        mmu_state_q <= mmu_state_d;
+      end
+    end
+
+    // Straightforward and slow-reactive MMU arbitration logic
+    // This logic can be optimized to reduce answer latency and contention
+    always_comb begin
+      // Maintain state
+      mmu_state_d = mmu_state_q;
+
+      // Serve CVA6 and gate the accelerator by default
+      // MMU input
+      misaligned_exception   = cva6_misaligned_exception;
+      st_translation_req     = cva6_st_translation_req;
+      translation_req        = cva6_translation_req;
+      mmu_vaddr              = cva6_mmu_vaddr;
+      // MMU output
+      cva6_translation_valid = translation_valid;
+      cva6_mmu_paddr         = mmu_paddr;
+      cva6_mmu_exception     = mmu_exception;
+      cva6_dtlb_hit          = dtlb_hit;
+      cva6_dtlb_ppn          = dtlb_ppn;
+      acc_mmu_valid_o        = '0;
+      acc_mmu_paddr_o        = '0;
+      acc_mmu_exception_o    = '0;
+      acc_mmu_dtlb_hit_o     = '0;
+      acc_mmu_dtlb_ppn_o     = '0;
+
+      unique case (mmu_state_q)
+        CVA6: begin
+          // Only the accelerator is requesting, and the lsu bypass queue is empty.
+          if (acc_mmu_req_i && !lsu_valid_i && lsu_ready_o) begin
+            // Lock the MMU to the accelerator.
+            // If the issue stage is firing a mem op in this cycle,
+            // the bypass queue will buffer it.
+            mmu_state_d = ACC;
+          end
+          // Make this a mealy FSM to cut some latency.
+          // It should be okay timing-wise since cva6's requests already
+          // depend on lsu_valid_i. Moreover, lsu_ready_o is sequentially
+          // generated by the bypass and, in this first implementation,
+          // the acc request already depends combinatorially upon acc_mmu_req_i.
+        end
+        ACC: begin
+          // MMU input
+          misaligned_exception   = acc_mmu_misaligned_ex_i;
+          st_translation_req     = acc_mmu_is_store_i;
+          translation_req        = acc_mmu_req_i;
+          mmu_vaddr              = acc_mmu_vaddr_i;
+          // MMU output
+          acc_mmu_valid_o        = translation_valid;
+          acc_mmu_paddr_o        = mmu_paddr;
+          acc_mmu_exception_o    = mmu_exception;
+          acc_mmu_dtlb_hit_o     = dtlb_hit;
+          acc_mmu_dtlb_ppn_o     = dtlb_ppn;
+          cva6_translation_valid = '0;
+          cva6_mmu_paddr         = '0;
+          cva6_mmu_exception     = '0;
+          cva6_dtlb_hit          = '0;
+          cva6_dtlb_ppn          = '0;
+          // Get back to CVA6 after the translation
+          if (translation_valid) mmu_state_d = CVA6;
+        end
+        default: mmu_state_d = CVA6;
+      endcase
+    end
 
     logic store_buffer_empty;
     // ------------------
@@ -283,12 +348,12 @@ module load_store_unit import ariane_pkg::*; #(
         .result_o              ( st_result            ),
         .ex_o                  ( st_ex                ),
         // MMU port
-        .translation_req_o     ( st_translation_req   ),
+        .translation_req_o     ( cva6_st_translation_req   ),
         .vaddr_o               ( st_vaddr             ),
         .mem_paddr_o           ( mem_paddr_o          ),
-        .paddr_i               ( mmu_paddr            ),
-        .ex_i                  ( mmu_exception        ),
-        .dtlb_hit_i            ( dtlb_hit             ),
+        .paddr_i               ( cva6_mmu_paddr            ),
+        .ex_i                  ( cva6_mmu_exception        ),
+        .dtlb_hit_i            ( cva6_dtlb_hit             ),
         // Load Unit
         .page_offset_i         ( page_offset          ),
         .page_offset_matches_o ( page_offset_matches  ),
@@ -317,10 +382,10 @@ module load_store_unit import ariane_pkg::*; #(
         // MMU port
         .translation_req_o     ( ld_translation_req   ),
         .vaddr_o               ( ld_vaddr             ),
-        .paddr_i               ( mmu_paddr            ),
-        .ex_i                  ( mmu_exception        ),
-        .dtlb_hit_i            ( dtlb_hit             ),
-        .dtlb_ppn_i            ( dtlb_ppn             ),
+        .paddr_i               ( cva6_mmu_paddr            ),
+        .ex_i                  ( cva6_mmu_exception        ),
+        .dtlb_hit_i            ( cva6_dtlb_hit             ),
+        .dtlb_ppn_i            ( cva6_dtlb_ppn             ),
         // to store unit
         .page_offset_o         ( page_offset          ),
         .page_offset_matches_i ( page_offset_matches  ),
@@ -366,22 +431,22 @@ module load_store_unit import ariane_pkg::*; #(
         ld_valid_i = 1'b0;
         st_valid_i = 1'b0;
 
-        translation_req      = 1'b0;
-        mmu_vaddr            = {riscv::VLEN{1'b0}};
+        cva6_translation_req      = 1'b0;
+        cva6_mmu_vaddr            = {riscv::VLEN{1'b0}};
 
         // check the operation to activate the right functional unit accordingly
         unique case (lsu_ctrl.fu)
             // all loads go here
             LOAD:  begin
                 ld_valid_i           = lsu_ctrl.valid;
-                translation_req      = ld_translation_req;
-                mmu_vaddr            = ld_vaddr;
+                cva6_translation_req      = ld_translation_req;
+                cva6_mmu_vaddr            = ld_vaddr;
             end
             // all stores go here
             STORE: begin
                 st_valid_i           = lsu_ctrl.valid;
-                translation_req      = st_translation_req;
-                mmu_vaddr            = st_vaddr;
+                cva6_translation_req      = cva6_st_translation_req;
+                cva6_mmu_vaddr            = st_vaddr;
             end
             // not relevant for the LSU
             default: ;
@@ -406,7 +471,7 @@ module load_store_unit import ariane_pkg::*; #(
     // can augment the exception if other memory related exceptions like a page fault or access errors
     always_comb begin : data_misaligned_detection
 
-        misaligned_exception = {
+        cva6_misaligned_exception = {
             {riscv::XLEN{1'b0}},
             {riscv::XLEN{1'b0}},
             1'b0
@@ -450,14 +515,14 @@ module load_store_unit import ariane_pkg::*; #(
         if (data_misaligned) begin
 
             if (lsu_ctrl.fu == LOAD) begin
-                misaligned_exception = {
+                cva6_misaligned_exception = {
                     riscv::LD_ADDR_MISALIGNED,
                     {{riscv::XLEN-riscv::VLEN{1'b0}},lsu_ctrl.vaddr},
                     1'b1
                 };
 
             end else if (lsu_ctrl.fu == STORE) begin
-                misaligned_exception = {
+                cva6_misaligned_exception = {
                     riscv::ST_ADDR_MISALIGNED,
                     {{riscv::XLEN-riscv::VLEN{1'b0}},lsu_ctrl.vaddr},
                     1'b1
@@ -468,14 +533,14 @@ module load_store_unit import ariane_pkg::*; #(
         if (en_ld_st_translation_i && lsu_ctrl.overflow) begin
 
             if (lsu_ctrl.fu == LOAD) begin
-                misaligned_exception = {
+                cva6_misaligned_exception = {
                     riscv::LD_ACCESS_FAULT,
                     {{riscv::XLEN-riscv::VLEN{1'b0}},lsu_ctrl.vaddr},
                     1'b1
                 };
 
             end else if (lsu_ctrl.fu == STORE) begin
-                misaligned_exception = {
+                cva6_misaligned_exception = {
                     riscv::ST_ACCESS_FAULT,
                     {{riscv::XLEN-riscv::VLEN{1'b0}},lsu_ctrl.vaddr},
                     1'b1
@@ -498,10 +563,17 @@ module load_store_unit import ariane_pkg::*; #(
         .pop_ld_i           ( pop_ld      ),
         .pop_st_i           ( pop_st      ),
 
-        .lsu_ctrl_o         ( lsu_ctrl    ),
+        .lsu_ctrl_o         ( lsu_ctrl_byp),
         .ready_o            ( lsu_ready_o ),
         .*
     );
+
+    // Mask the lsu valid so that the cva6 req gets buffered in the
+    // bypass queue when the MMU is being used by the accelerator.
+    always_comb begin
+      lsu_ctrl       = lsu_ctrl_byp;
+      lsu_ctrl.valid = (mmu_state_q == ACC) ? 1'b0 : lsu_ctrl_byp.valid;
+    end
 
     assign lsu_addr_o = lsu_ctrl.vaddr;
     assign lsu_rmask_o = lsu_ctrl.fu == LOAD ? lsu_ctrl.be : '0;
